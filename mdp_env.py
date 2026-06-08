@@ -217,10 +217,10 @@ class UASWindEnv:
         val_list = [1.3, 1.3, 1.31, 1.35, 1.395, 1.365, 1.32, 1.3]
 
 
-        # 计算航向与风向的夹角 [0, 180]
+        # 计算航向与风向的夹角 [0, 180]（物理上 270° 与 90° 相对夹角相同）
         diff = abs(wdeg - psi_deg) % 360
-        '''if diff > 180:
-            diff = 360 - diff'''
+        if diff > 180:
+            diff = 360 - diff
 
         # 匹配预设角度，取对应值；无匹配默认1.3
         delta_v = 1.3
@@ -253,11 +253,10 @@ class UASWindEnv:
         # 对应返回的 delta_v 值
         val_list = [1.3, 1.3, 1.31, 1.35, 1.395, 1.365, 1.32, 1.3]
 
-        # 计算航向与风向的夹角 [0, 180]
+        # 计算航向与风向的夹角 [0, 180]（物理上 270° 与 90° 相对夹角相同）
         diff = abs(wdeg - psi_deg) % 360
-        '''
         if diff > 180:
-            diff = 360 - diff'''
+            diff = 360 - diff
 
         # 匹配预设角度，取对应值；无匹配默认1.3
         delta_v = 1.3
@@ -347,3 +346,28 @@ class UASWindEnv:
         return _TIME_OBSTACLE_PENALTY if self.reward_mode == 'time' else OBSTACLE_PENALTY
 
     def get_T(self): return self._T
+
+    def deterministic_step(self, ai: int):
+        """
+        确定性单步推进：取转移概率最高的下一状态，
+        用于评估阶段消除随机性，使路径指标可复现。
+        """
+        col, row = self.pos
+        if (col, row) == self.goal:
+            return self.s2idx(*self.goal), self._goal_reward(), True
+
+        trans = self._T.get((col, row, ai), {(col, row): 1.0})
+        # 取概率最大的下一格（确定性）
+        nc, nr = max(trans.items(), key=lambda x: x[1])[0]
+
+        r = self.reward(col, row, self.ACTIONS[ai])
+        self.pos = [nc, nr]
+        done = (nc, nr) == self.goal
+
+        if done:
+            r += self._goal_reward()
+        if (nc, nr) in self.obstacles:
+            r -= self._obstacle_penalty()
+            done = True
+
+        return self.s2idx(nc, nr), r, done

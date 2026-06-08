@@ -1,24 +1,11 @@
-# main_multiseed.py — 多种子实验主程序（精简版）
+# main_multiseed.py — 多种子实验主程序（三算法对比版）
 #
 # 用法示例：
-#   python main_multiseed.py --wind circular --reward time
-#   python main_multiseed.py --wind uniform  --reward energy --seeds 0 1 2 3 4
-#   python main_multiseed.py --wind circular --reward energy --seeds 42 7 13 99 2025 --ep 500
+#   python main_multiseed.py --wind circular --reward energy
+#   python main_multiseed.py --wind uniform  --reward time --seeds 0 1 2 3 4
 #
-# 输出：outputs/multiseed_{wind}_{reward}/
-#   ├── seed_{s}/              每个种子的原始数据（.npz）
-#   ├── summary_table.csv
-#   ├── metrics_mean.png
-#   ├── learning_curves.png
-#   ├── efficiency_metrics.png
-#   ├── stability_metrics.png
-#   └── q_overestimation.png
-#
-# 模块分工：
-#   metrics.py    — 指标计算（AUC、首达、收敛、稳定性、Q过估计）
-#   plotting.py   — 所有绘图函数
-#   experiment.py — 单种子运行、聚合、CSV保存
-#   showdata.py   — 终端汇总打印
+# 对比算法：
+#   VI / DQN-Basic / DQN-ε only / DQN-ε+PER
 
 import os
 import argparse
@@ -28,24 +15,21 @@ from config import N_EPISODES, OUTPUT_DIR, OBSTACLE_DENSITY, OBSTACLE_SEED
 from experiment import run_one_seed, save_seed_data, aggregate, save_csv
 from plotting import (
     plot_seed_paths, plot_metrics_mean, plot_learning_curves,
-    plot_efficiency_metrics, plot_stability_metrics, plot_q_overestimation,plot_sample_efficiency
+    plot_efficiency_metrics, plot_stability_metrics,
+    plot_q_overestimation, plot_sample_efficiency,
 )
 from showdata import print_summary
 
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 random.seed(2026)
-_default_seeds = random.sample(range(1, 3001), 1)
+_default_seeds = random.sample(range(1, 3001), 5)
 
-parser = argparse.ArgumentParser(description="Multi-seed UAV experiment")
+parser = argparse.ArgumentParser(description="Multi-seed UAV ablation experiment")
 parser.add_argument("--seeds",    type=int, nargs="+", default=_default_seeds)
 parser.add_argument("--wind",     default="circular", choices=["uniform", "circular"])
-parser.add_argument("--reward",   default="energy",     choices=["energy", "time"])
+parser.add_argument("--reward",   default="energy",   choices=["energy", "time"])
 parser.add_argument("--ep",       type=int, default=N_EPISODES)
-parser.add_argument("--density",  type=float, default=None,
-                    help="障碍物密度（默认使用 config.OBSTACLE_DENSITY）")
-parser.add_argument("--obs_seed", type=int, default=None,
-                    help="障碍物随机种子（默认使用 config.OBSTACLE_SEED）")
+parser.add_argument("--density",  type=float, default=None)
+parser.add_argument("--obs_seed", type=int,   default=None)
 args = parser.parse_args()
 
 SEEDS    = args.seeds
@@ -58,18 +42,16 @@ OBS_SEED = args.obs_seed
 _density_val  = DENSITY  if DENSITY  is not None else OBSTACLE_DENSITY
 _obs_seed_val = OBS_SEED if OBS_SEED is not None else OBSTACLE_SEED
 
-OUT_ROOT = os.path.join(OUTPUT_DIR, f"multiseed_{WIND}_{REWARD}")
+OUT_ROOT = os.path.join(OUTPUT_DIR, f"ablation_{WIND}_{REWARD}")
 os.makedirs(OUT_ROOT, exist_ok=True)
 
 print("=" * 65)
-print(f"  Multi-seed experiment  v2 (Full Metric Suite)")
+print(f"  Ablation Experiment: Basic vs ε-only vs ε+PER")
 print(f"  Wind={WIND}  Reward={REWARD}  Episodes={N_EP}")
 print(f"  Seeds={SEEDS}")
 print(f"  Obstacles: density={_density_val:.3f}  obs_seed={_obs_seed_val}")
 print("=" * 65)
 
-
-# ── 主流程 ────────────────────────────────────────────────────────────────────
 all_results = []
 path_images = []
 
@@ -83,10 +65,8 @@ for seed in SEEDS:
     path_images.append(img)
     all_results.append(result)
 
-# ── 统计聚合 ──────────────────────────────────────────────────────────────────
 stats = aggregate(all_results)
 
-# ── 输出文件 ──────────────────────────────────────────────────────────────────
 csv_path       = os.path.join(OUT_ROOT, "summary_table.csv")
 metrics_png    = os.path.join(OUT_ROOT, "metrics_mean.png")
 curves_png     = os.path.join(OUT_ROOT, "learning_curves.png")
@@ -101,12 +81,12 @@ plot_learning_curves(all_results, curves_png, SEEDS, WIND, REWARD)
 plot_efficiency_metrics(stats, all_results, efficiency_png, SEEDS, WIND, REWARD)
 plot_stability_metrics(stats, all_results, stability_png, SEEDS, WIND, REWARD)
 plot_q_overestimation(stats, all_results, q_over_png, SEEDS, WIND, REWARD)
-plot_sample_efficiency(all_results, q_over_png, SEEDS, WIND, REWARD)
+plot_sample_efficiency(all_results, sample_eff_png, SEEDS, WIND, REWARD)
 
-# ── 终端汇总 ──────────────────────────────────────────────────────────────────
 print_summary(stats, SEEDS, WIND, REWARD)
 
 print(f"\n✅ 全部完成，结果保存在: {OUT_ROOT}/")
 print("\n  生成文件列表：")
-for f in path_images + [metrics_png, curves_png, efficiency_png, stability_png, q_over_png, sample_eff_png,csv_path]:
+for f in path_images + [metrics_png, curves_png, efficiency_png,
+                         stability_png, q_over_png, sample_eff_png, csv_path]:
     print(f"    {f}")

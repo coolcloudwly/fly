@@ -260,7 +260,7 @@ class ImprovedPER:
         prios = self.priorities[:self.size]
         probs = prios ** self.alpha
         probs /= probs.sum()
-        indices = np.random.choice(self.size, batch_size, p=probs, replace=True)
+        indices = np.random.choice(self.size, batch_size, p=probs, replace=False)
         weights = (self.size * probs[indices]) ** (-beta)
         weights /= weights.max()
         return (

@@ -1,13 +1,6 @@
-# experiment.py — 单种子实验流程、数据聚合与 CSV 保存
+# experiment.py — 单种子实验流程（三算法对比版）
 #
-# 包含：
-#   make_env()       — 环境构建（风场 + 障碍物配置）
-#   get_path()       — 贪婪策略推理路径
-#   vi_path_actions()— VI 路径动作名重建
-#   run_one_seed()   — 单种子完整实验（VI + Basic + Improved）
-#   save_seed_data() — 单种子数据持久化（.npz）
-#   aggregate()      — 多种子统计聚合（均值 ± std）
-#   save_csv()       — 汇总 CSV 输出
+# 算法：VI / DQN-Basic / DQN-eps_only / DQN-eps_per
 
 import os
 import time
@@ -31,25 +24,21 @@ from metrics import (
 
 MAX_PATH_STEPS = 50
 
-# ── 指标分组（供 aggregate / save_csv 使用）───────────────────────────────────
 PATH_METRICS       = ['energy', 'time', 'distance', 'steps']
 EFFICIENCY_METRICS = ['auc', 'first_reach_ep', 'convergence_ep', 'train_time']
 STABILITY_METRICS  = ['late_rolling_std', 'negative_spikes']
 QUALITY_METRICS    = ['q_overestimation']
 ALL_SCALAR_METRICS = PATH_METRICS + EFFICIENCY_METRICS + STABILITY_METRICS + QUALITY_METRICS
 
+# 三个 DQN 算法的 key / label / eps_mode 映射
+DQN_ALGOS = [
+    ('basic',    'DQN-Basic',    'basic'),
+    ('eps_only', 'DQN-eps_only', 'eps_only'),
+    ('eps_per',  'DQN-eps_per',  'eps_per'),
+]
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 环境构建
-# ══════════════════════════════════════════════════════════════════════════════
+
 def make_env(reward_mode, wind, density=None, obs_seed=None):
-    """
-    构建 UASWindEnv。
-
-    若 density 或 obs_seed 不为 None，则调用 set_random_obstacles()
-    覆盖 config.OBSTACLE_CELLS 中的默认障碍物布局；
-    否则使用 config.py 中 generate_random_obstacles() 预生成的默认布局。
-    """
     env = UASWindEnv(reward_mode=reward_mode)
     if density is not None or obs_seed is not None:
         env.set_random_obstacles(
@@ -61,27 +50,21 @@ def make_env(reward_mode, wind, density=None, obs_seed=None):
     return env
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 路径推理工具
-# ══════════════════════════════════════════════════════════════════════════════
 def get_path(agent, env):
-    """贪婪策略推理路径（ε=0 等价）。"""
     env.reset()
     c, r    = env.start
     path    = [(c, r)]
     actions = []
     visit_count = {(c, r): 1}
-    is_dae      = hasattr(agent, 'meta')
-    policy_net  = agent.meta if is_dae else agent.q_net
 
     for _ in range(MAX_PATH_STEPS):
         if (c, r) == env.goal:
             break
         s_t = env.state_tensor(env.s2idx(c, r))
         with torch.no_grad():
-            a = int(policy_net(s_t.unsqueeze(0)).argmax().item())
+            a = int(agent.q_net(s_t.unsqueeze(0)).argmax().item())
         a_name = env.ACTIONS[a]
-        s_next, _, done = env.step(a)
+        s_next, _, done = env.deterministic_step(a)
         c_next, r_next  = env.idx2s(s_next)
         actions.append(a_name)
         path.append((c_next, r_next))
@@ -93,7 +76,6 @@ def get_path(agent, env):
 
 
 def vi_path_actions(env, path):
-    """从 VI 路径坐标序列还原动作名列表。"""
     delta_inv = {v: k for k, v in env.DELTAS.items()}
     actions   = []
     for (c0, r0), (c1, r1) in zip(path[:-1], path[1:]):
@@ -104,105 +86,68 @@ def vi_path_actions(env, path):
     return actions
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 单种子完整实验
-# ══════════════════════════════════════════════════════════════════════════════
-def run_one_seed(seed: int, wind: str, reward: str,
-                 n_ep: int = N_EPISODES,
-                 density: float = None, obs_seed: int = None) -> dict:
-    """
-    运行单个种子的完整实验：VI + DQN-Basic + DQN-Improved。
-
-    返回结构化结果字典，包含路径指标、学习效率、稳定性、Q过估计等全部指标。
-    """
+def _run_dqn(key, eps_mode, seed, wind, reward, n_ep, density, obs_seed):
+    """训练单个 DQN 变体，返回指标 dict。"""
     set_seed(seed)
-    env = make_env(reward, wind, density, obs_seed)
+    env   = make_env(reward, wind, density, obs_seed)
+    agent = DQNAgent(eps_mode=eps_mode)
+    t0    = time.time()
+    hist  = train(env, agent, n_ep, MAX_STEPS, verbose=False)
+    train_time = time.time() - t0
 
-    # ── 1. VI ─────────────────────────────────────────────────────────────────
+    path, acts = get_path(agent, env)
+    m = env.path_metrics(path, acts)
+
+    rews = hist['rewards']
+    sm   = smooth(rews, 30)
+    m['rewards']          = rews
+    m['train_time']       = train_time
+    m['auc']              = compute_auc(rews)
+    m['first_reach_ep']   = compute_first_reach(rews)
+    m['convergence_ep']   = compute_convergence_episode(rews)
+    m['late_rolling_std'] = compute_late_rolling_std(rews)
+    m['negative_spikes']  = compute_negative_spike_count(rews, sm)
+    m['q_overestimation'] = compute_q_overestimation(agent, env, rews)
+    m['degradation']      = float('nan')
+
+    return m, path, env, agent
+
+
+def run_one_seed(seed, wind, reward,
+                 n_ep=N_EPISODES,
+                 density=None, obs_seed=None):
+    set_seed(seed)
+    env_vi = make_env(reward, wind, density, obs_seed)
+
+    # ── VI ────────────────────────────────────────────────────
     print(f"\n  [Seed={seed}] Value Iteration ...")
-    t0_vi        = time.time()
-    V, vi_policy = value_iteration(env)
-    vi_path      = extract_path(env, vi_policy)
-    vi_acts      = vi_path_actions(env, vi_path)
-    vi_m         = env.path_metrics(vi_path, vi_acts)
-    vi_m['train_time'] = time.time() - t0_vi
-    print(f"train_time:{vi_m['train_time']}")
+    t0 = time.time()
+    V, vi_policy = value_iteration(env_vi)
+    vi_path      = extract_path(env_vi, vi_policy)
+    vi_acts      = vi_path_actions(env_vi, vi_path)
+    vi_m         = env_vi.path_metrics(vi_path, vi_acts)
+    vi_m['train_time'] = time.time() - t0
+    vi_m['degradation'] = float('nan')
 
-    # ── 2. DQN-Basic ──────────────────────────────────────────────────────────
-    print(f"  [Seed={seed}] DQN-Basic ...")
-    set_seed(seed)
-    env_b   = make_env(reward, wind, density, obs_seed)
-    agent_b = DQNAgent(eps_mode="basic")
-    t0_b    = time.time()
-    hist_b  = train(env_b, agent_b, n_ep, MAX_STEPS, verbose=False)
-    train_time_b   = time.time() - t0_b
-    path_b, acts_b = get_path(agent_b, env_b)
-    m_b = env_b.path_metrics(path_b, acts_b)
+    result = {'vi': vi_m, '_paths': {'vi': (vi_path, env_vi)}, '_agents': {}}
 
-    rews_b = hist_b['rewards']
-    sm_b   = smooth(rews_b, 30)
-    m_b['rewards']          = rews_b
-    m_b['train_time']       = train_time_b
-    m_b['auc']              = compute_auc(rews_b)
-    m_b['first_reach_ep']   = compute_first_reach(rews_b)
-    m_b['convergence_ep']   = compute_convergence_episode(rews_b)
-    m_b['late_rolling_std'] = compute_late_rolling_std(rews_b)
-    m_b['negative_spikes']  = compute_negative_spike_count(rews_b, sm_b)
-    m_b['q_overestimation'] = compute_q_overestimation(agent_b, env_b, rews_b)
-    m_b['degradation']      = float('nan')
+    # ── 三个 DQN 变体 ─────────────────────────────────────────
+    for key, label, eps_mode in DQN_ALGOS:
+        print(f"  [Seed={seed}] {label} ...")
+        m, path, env, agent = _run_dqn(key, eps_mode, seed, wind, reward,
+                                        n_ep, density, obs_seed)
+        result[key]               = m
+        result['_paths'][key]     = (path, env)
+        result['_agents'][key]    = agent
 
-    # ── 3. DQN-Improved ───────────────────────────────────────────────────────
-    print(f"  [Seed={seed}] DQN-Improved ...")
-    set_seed(seed)
-    env_i   = make_env(reward, wind, density, obs_seed)
-    agent_i = DQNAgent(eps_mode="improved")
-    t0_i    = time.time()
-    hist_i  = train(env_i, agent_i, n_ep, MAX_STEPS, verbose=False)
-    train_time_i   = time.time() - t0_i
-    path_i, acts_i = get_path(agent_i, env_i)
-    m_i = env_i.path_metrics(path_i, acts_i)
+        print(f"  [Seed={seed}] {label}: "
+              f"{'✅' if m['reached_goal'] else '❌'}{m['steps']}步  "
+              f"AUC={m['auc']:+.2f}  Q̂/MC={m['q_overestimation']:.3f}")
 
-    rews_i = hist_i['rewards']
-    sm_i   = smooth(rews_i, 30)
-    m_i['rewards']          = rews_i
-    m_i['train_time']       = train_time_i
-    m_i['auc']              = compute_auc(rews_i)
-    m_i['first_reach_ep']   = compute_first_reach(rews_i)
-    m_i['convergence_ep']   = compute_convergence_episode(rews_i)
-    m_i['late_rolling_std'] = compute_late_rolling_std(rews_i)
-    m_i['negative_spikes']  = compute_negative_spike_count(rews_i, sm_i)
-    m_i['q_overestimation'] = compute_q_overestimation(agent_i, env_i, rews_i)
-    m_i['degradation']      = float('nan')
-    vi_m['degradation']     = float('nan')
-
-    print(f"  [Seed={seed}] Done. "
-          f"VI={vi_m['steps']}步 "
-          f"Basic={'✅' if m_b['reached_goal'] else '❌'}{m_b['steps']}步 "
-          f"Improved={'✅' if m_i['reached_goal'] else '❌'}{m_i['steps']}步")
-    print(f"           AUC  Basic={m_b['auc']:+.2f}  Improved={m_i['auc']:+.2f}")
-    print(f"           Q̂/MC Basic={m_b['q_overestimation']:.3f}  Improved={m_i['q_overestimation']:.3f}")
-
-    return {
-        'vi':       vi_m,
-        'basic':    m_b,
-        'improved': m_i,
-        '_paths': {
-            'vi':       (vi_path, env),
-            'basic':    (path_b,  env_b),
-            'improved': (path_i,  env_i),
-        },
-        '_agents': {
-            'basic':    agent_b,
-            'improved': agent_i,
-        },
-    }
+    return result
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 数据持久化
-# ══════════════════════════════════════════════════════════════════════════════
-def save_seed_data(seed: int, result: dict, out_root: str):
-    """将单种子结果保存为 .npz 文件（不含路径/智能体对象）。"""
+def save_seed_data(seed, result, out_root):
     seed_dir  = os.path.join(out_root, f"seed_{seed}")
     os.makedirs(seed_dir, exist_ok=True)
     skip_keys = {'_paths', '_agents'}
@@ -220,22 +165,12 @@ def save_seed_data(seed: int, result: dict, out_root: str):
             np.savez(os.path.join(seed_dir, f"{algo}.npz"), **data)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 统计聚合
-# ══════════════════════════════════════════════════════════════════════════════
-def aggregate(all_results: list) -> dict:
-    """
-    对所有种子结果做均值 ± 标准差。
-    路径质量指标仅统计成功到达终点的种子。
-    额外计算：跨 seed 奖励方差（multi-seed reward variance）。
-    """
-    algos = ['vi', 'basic', 'improved']
+def aggregate(all_results):
+    algos = ['vi'] + [k for k, _, _ in DQN_ALGOS]
     stats = {}
 
     for algo in algos:
         stats[algo] = {}
-
-        # 标量指标
         for metric in ALL_SCALAR_METRICS:
             vals = []
             for r in all_results:
@@ -257,20 +192,17 @@ def aggregate(all_results: list) -> dict:
             else:
                 stats[algo][metric] = {'mean': float('nan'), 'std': float('nan'), 'vals': []}
 
-        # 到达率
         stats[algo]['success_rate'] = float(
             np.mean([r[algo]['reached_goal'] for r in all_results])
         )
 
-        # 多 seed 奖励方差
-        if algo in ('basic', 'improved'):
+        if algo != 'vi':
             reward_seqs = [np.array(r[algo]['rewards']) for r in all_results
                            if 'rewards' in r[algo]]
             if len(reward_seqs) >= 2:
                 min_len    = min(len(s) for s in reward_seqs)
                 mat        = np.stack([s[:min_len] for s in reward_seqs])
-                per_ep_var = mat.var(axis=0)
-                stats[algo]['multiseed_reward_var'] = float(per_ep_var.mean())
+                stats[algo]['multiseed_reward_var'] = float(mat.var(axis=0).mean())
             else:
                 stats[algo]['multiseed_reward_var'] = float('nan')
         else:
@@ -279,11 +211,10 @@ def aggregate(all_results: list) -> dict:
     return stats
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CSV 输出
-# ══════════════════════════════════════════════════════════════════════════════
-def save_csv(stats: dict, path: str):
-    """将聚合统计写入 CSV 文件。"""
+def save_csv(stats, path):
+    algo_keys  = ['vi'] + [k for k, _, _ in DQN_ALGOS]
+    name_map   = {'vi': 'VI', 'basic': 'DQN-Basic',
+                  'eps_only': 'DQN-eps_only', 'eps_per': 'DQN-eps_per'}
     header_cols = (
         ['Algorithm']
         + [f"{m}_mean,{m}_std" for m in PATH_METRICS]
@@ -293,11 +224,9 @@ def save_csv(stats: dict, path: str):
         + [f"{m}_mean,{m}_std" for m in STABILITY_METRICS]
         + [f"{m}_mean,{m}_std" for m in QUALITY_METRICS]
     )
-    header   = ','.join(header_cols)
-    name_map = {'vi': 'VI', 'basic': 'DQN-Basic', 'improved': 'DQN-Improved'}
-    lines    = [header]
+    lines = [','.join(header_cols)]
 
-    for algo in ['vi', 'basic', 'improved']:
+    for algo in algo_keys:
         s    = stats[algo]
         cols = [name_map[algo]]
         for m in PATH_METRICS:
